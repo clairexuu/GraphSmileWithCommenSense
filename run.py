@@ -1,3 +1,11 @@
+"""
+python -u run.py --gpu 0 --port 1532 --classify emotion \
+--dataset MELD --epochs 50 --textf_mode concat13 \
+--loss_type emo_sen_sft --lr 7e-05 --batch_size 16 --hidden_dim 384 \
+--win 3 3 --heter_n_layers 5 5 5 --drop 0.2 --shift_win 3 --lambd 1.0 0.5 0.2
+
+Path to feature pickle files might need to be modified.
+"""
 import logging
 import os
 import numpy as np
@@ -12,17 +20,15 @@ import torch.multiprocessing as mp
 from torch.utils.data.distributed import DistributedSampler
 import time
 from utils import AutomaticWeightedLoss
-from model import GraphSmile
+from hybrid_model import ModifiedGraphSmile
+# from model import GraphSmile # Change to this to only GraphSmile architecture just with all feature concatenated
 from sklearn.metrics import confusion_matrix, classification_report
 from trainer import train_or_eval_model, seed_everything
-from dataloader import (
-    IEMOCAPDataset_BERT,
-    IEMOCAPDataset_BERT4,
-    MELDDataset_BERT,
-    CMUMOSEIDataset7,
-)
+from dataloader import MELDDataset_BERT
 from torch.utils.data import DataLoader
+from model_utils import create_model_saver
 import argparse
+import platform
 
 parser = argparse.ArgumentParser()
 
@@ -60,13 +66,13 @@ parser.add_argument("--tensorboard",
 parser.add_argument("--modals", default="avl", help="modals")
 parser.add_argument(
     "--dataset",
-    default="IEMOCAP",
+    default="MELD",
     help="dataset to train and test.MELD/IEMOCAP/IEMOCAP4/CMUMOSEI7",
 )
 parser.add_argument(
     "--textf_mode",
-    default="textf0",
-    help="concat4/concat2/textf0/textf1/textf2/textf3/sum2/sum4",
+    default="concat13",
+    help="text feature mode: textf0/textf1/textf2/textf3/concat2/concat4/concat13/sum2/sum4",
 )
 
 parser.add_argument(
@@ -115,6 +121,9 @@ parser.add_argument(
     help="[loss_emotion, loss_sentiment, loss_shift]",
 )
 
+parser.add_argument('--balance_strategy', default='oversample', help='oversample / subsample / None')
+parser.add_argument('--balance_target', default='emotion', help='Target for class balancing')
+
 args = parser.parse_args()
 
 os.environ["MASTER_ADDR"] = "localhost"
@@ -123,10 +132,8 @@ os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
 world_size = torch.cuda.device_count()
 os.environ["WORLD_SIZE"] = str(world_size)
 
-MELD_path = ""
-IEMOCAP_path = ""
-IEMOCAP4_path = ""
-CMUMOSEI7_path = ""
+MELD_path = "features/meld_multi_features.pkl"
+COMET_path = "features/meld_multi_features.pkl"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -137,7 +144,9 @@ def init_ddp(local_rank):
         if not dist.is_initialized():
             torch.cuda.set_device(local_rank)
             os.environ["RANK"] = str(local_rank)
-            dist.init_process_group(backend="nccl", init_method="env://")
+            # dist.init_process_group(backend="nccl", init_method="env://")
+            backend = "gloo" if platform.system() == "Windows" else "nccl"
+            dist.init_process_group(backend=backend, init_method="env://")
         else:
             logger.info("Distributed process group already initialized.")
     except Exception as e:
@@ -169,10 +178,10 @@ def get_train_valid_sampler(trainset, valid_ratio):
     return DistributedSampler(idx[split:]), DistributedSampler(idx[:split])
 
 
-def get_data_loaders(path, dataset_class, batch_size, valid_ratio, num_workers,
-                     pin_memory):
-
-    trainset = dataset_class(path)
+def get_data_loaders(comet_path, meld_path, dataset_class, batch_size, valid_ratio, num_workers,
+                     pin_memory, balance_strategy=None, balance_target='emotion'):
+    trainset = dataset_class(comet_path, meld_path, train=True,
+                             balance_strategy=balance_strategy, balance_target=balance_target)
     train_sampler, valid_sampler = get_train_valid_sampler(
         trainset, valid_ratio)
     train_loader = DataLoader(
@@ -191,7 +200,7 @@ def get_data_loaders(path, dataset_class, batch_size, valid_ratio, num_workers,
         num_workers=num_workers,
         pin_memory=pin_memory,
     )
-    testset = dataset_class(path, train=False)
+    testset = dataset_class(comet_path, meld_path, train=False)
     test_loader = DataLoader(
         testset,
         batch_size=batch_size,
@@ -217,6 +226,14 @@ def main(local_rank):
     today = datetime.datetime.now()
     name_ = args.modals + "_" + args.dataset
 
+    # Create model saver for this experiment
+    balance_suffix = f"_{args.balance_strategy}_{args.balance_target}" if args.balance_strategy else ""
+    experiment_name = f"{name_}_{args.textf_mode}_{args.classify}{balance_suffix}"
+    model_saver = create_model_saver(experiment_name) if local_rank == 0 else None
+
+    if local_rank == 0:
+        model_saver.save_experiment_config(args)
+
     cuda = torch.cuda.is_available() and not args.no_cuda
     if args.tensorboard:
         from tensorboardX import SummaryWriter
@@ -227,24 +244,11 @@ def main(local_rank):
     batch_size = args.batch_size
     modals = args.modals
 
-    if args.dataset == "IEMOCAP":
-        embedding_dims = [1024, 342, 1582]
-    elif args.dataset == "IEMOCAP4":
-        embedding_dims = [1024, 512, 100]
-    elif args.dataset == "MELD":
-        embedding_dims = [1024, 342, 300]
-    elif args.dataset == "CMUMOSEI7":
-        embedding_dims = [1024, 35, 384]
-
-    if args.dataset == "MELD" or args.dataset == "CMUMOSEI7":
-        n_classes_emo = 7
-    elif args.dataset == "IEMOCAP":
-        n_classes_emo = 6
-    elif args.dataset == "IEMOCAP4":
-        n_classes_emo = 4
+    embedding_dims = [1024, 342, 300]
+    n_classes_emo = 7
 
     seed_everything()
-    model = GraphSmile(args, embedding_dims, n_classes_emo)
+    model = ModifiedGraphSmile(args, embedding_dims, n_classes_emo)
 
     model = model.to(local_rank)
     model = DDP(
@@ -254,7 +258,18 @@ def main(local_rank):
         find_unused_parameters=True,
     )
 
+    # device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() and not args.no_cuda else "cpu")
+
+    # COSMIC_weights = torch.tensor(
+    #     [0.30427062, 1.19699616, 5.47007183, 1.95437696, 0.84847735, 5.42461417, 1.21859721],
+    #     dtype=torch.float32,
+    #     device=device
+    # )
+
+    # loss_function_emo = nn.NLLLoss(weight=COSMIC_weights)
+
     loss_function_emo = nn.NLLLoss()
+
     loss_function_sen = nn.NLLLoss()
     loss_function_shift = nn.NLLLoss()
 
@@ -280,44 +295,17 @@ def main(local_rank):
                                 weight_decay=args.l2,
                                 amsgrad=True)
 
-    if args.dataset == "MELD":
-        train_loader, valid_loader, test_loader = get_data_loaders(
-            path=MELD_path,
-            dataset_class=MELDDataset_BERT,
-            valid_ratio=0.1,
-            batch_size=batch_size,
-            num_workers=0,
-            pin_memory=False,
-        )
-    elif args.dataset == "IEMOCAP":
-        train_loader, valid_loader, test_loader = get_data_loaders(
-            path=IEMOCAP_path,
-            dataset_class=IEMOCAPDataset_BERT,
-            valid_ratio=0.1,
-            batch_size=batch_size,
-            num_workers=0,
-            pin_memory=False,
-        )
-    elif args.dataset == "IEMOCAP4":
-        train_loader, valid_loader, test_loader = get_data_loaders(
-            path=IEMOCAP4_path,
-            dataset_class=IEMOCAPDataset_BERT4,
-            valid_ratio=0.1,
-            batch_size=batch_size,
-            num_workers=0,
-            pin_memory=False,
-        )
-    elif args.dataset == "CMUMOSEI7":
-        train_loader, valid_loader, test_loader = get_data_loaders(
-            path=CMUMOSEI7_path,
-            dataset_class=CMUMOSEIDataset7,
-            valid_ratio=0.1,
-            batch_size=batch_size,
-            num_workers=0,
-            pin_memory=False,
-        )
-    else:
-        print("There is no such dataset")
+    train_loader, valid_loader, test_loader = get_data_loaders(
+        comet_path=COMET_path,
+        meld_path=MELD_path,
+        dataset_class=MELDDataset_BERT,
+        valid_ratio=0.1,
+        batch_size=batch_size,
+        num_workers=0,
+        pin_memory=False,
+        balance_strategy=args.balance_strategy,
+        balance_target=args.balance_target
+    )
 
     best_f1_emo, best_f1_sen, best_loss = None, None, None
     best_label_emo, best_pred_emo = None, None
@@ -328,14 +316,7 @@ def main(local_rank):
     all_f1_sft, all_acc_sft = [], []
 
     for epoch in range(n_epochs):
-        if args.dataset == "MELD":
-            trainset = MELDDataset_BERT(MELD_path)
-        elif args.dataset == "IEMOCAP":
-            trainset = IEMOCAPDataset_BERT(IEMOCAP_path)
-        elif args.dataset == "IEMOCAP4":
-            trainset = IEMOCAPDataset_BERT4(IEMOCAP4_path)
-        elif args.dataset == "CMUMOSEI7":
-            trainset = CMUMOSEIDataset7(CMUMOSEI7_path)
+        trainset = MELDDataset_BERT(MELD_path, train=True)
 
         setup_samplers(trainset, valid_ratio=0.1, epoch=epoch)
 
@@ -391,6 +372,26 @@ def main(local_rank):
                 valid_f1_emo,
             ))
 
+        # Update metrics in model saver
+        if local_rank == 0 and model_saver:
+            model_saver.update_metrics(
+                epoch=epoch + 1,
+                train_loss=train_loss,
+                train_acc_emo=train_acc_emo,
+                train_f1_emo=train_f1_emo,
+                train_acc_sen=train_acc_sen,
+                train_f1_sen=train_f1_sen,
+                train_acc_sft=train_acc_sft,
+                train_f1_sft=train_f1_sft,
+                valid_loss=valid_loss,
+                valid_acc_emo=valid_acc_emo,
+                valid_f1_emo=valid_f1_emo,
+                valid_acc_sen=valid_acc_sen,
+                valid_f1_sen=valid_f1_sen,
+                valid_acc_sft=valid_acc_sft,
+                valid_f1_sft=valid_f1_sft
+            )
+
         if local_rank == 0:
             test_loss, test_label_emo, test_pred_emo, test_acc_emo, test_f1_emo, test_label_sen, test_pred_sen, test_acc_sen, test_f1_sen, test_acc_sft, test_f1_sft, _, test_initial_feats, test_extracted_feats = train_or_eval_model(
                 model,
@@ -416,6 +417,18 @@ def main(local_rank):
             all_f1_sft.append(test_f1_sft)
             all_acc_sft.append(test_acc_sft)
 
+            # Update test metrics in model saver
+            if model_saver:
+                model_saver.update_metrics(
+                    test_loss=test_loss,
+                    test_acc_emo=test_acc_emo,
+                    test_f1_emo=test_f1_emo,
+                    test_acc_sen=test_acc_sen,
+                    test_f1_sen=test_f1_sen,
+                    test_acc_sft=test_acc_sft,
+                    test_f1_sft=test_f1_sft
+                )
+
             print(
                 "test_loss: {}, test_acc_emo: {}, test_f1_emo: {}, test_acc_sen: {}, test_f1_sen: {}, test_acc_sft: {}, test_f1_sft: {}, total time: {} sec, {}"
                 .format(
@@ -432,12 +445,14 @@ def main(local_rank):
                 ))
             print("-" * 100)
 
+            is_best = False
             if args.classify == "emotion":
                 if best_f1_emo == None or best_f1_emo < test_f1_emo:
                     best_f1_emo = test_f1_emo
                     best_f1_sen = test_f1_sen
                     best_label_emo, best_pred_emo = test_label_emo, test_pred_emo
                     best_label_sen, best_pred_sen = test_label_sen, test_pred_sen
+                    is_best = True
 
             elif args.classify == "sentiment":
                 if best_f1_sen == None or best_f1_sen < test_f1_sen:
@@ -445,6 +460,12 @@ def main(local_rank):
                     best_f1_sen = test_f1_sen
                     best_label_emo, best_pred_emo = test_label_emo, test_pred_emo
                     best_label_sen, best_pred_sen = test_label_sen, test_pred_sen
+                    is_best = True
+
+            # Save model checkpoint
+            if model_saver:
+                model_saver.save_model(model, optimizer, epoch + 1, is_best=is_best,
+                                       extra_info={'best_f1_emo': best_f1_emo, 'best_f1_sen': best_f1_sen})
 
             if (epoch + 1) % 10 == 0:
                 np.set_printoptions(suppress=True)
@@ -473,10 +494,10 @@ def main(local_rank):
         if epoch == 1:
             allocated_memory = torch.cuda.memory_allocated()
             reserved_memory = torch.cuda.memory_reserved()
-            print(f"Allocated Memory: {allocated_memory / 1024**2:.2f} MB")
-            print(f"Reserved Memory: {reserved_memory / 1024**2:.2f} MB")
+            print(f"Allocated Memory: {allocated_memory / 1024 ** 2:.2f} MB")
+            print(f"Reserved Memory: {reserved_memory / 1024 ** 2:.2f} MB")
             print(
-                f"All Memory: {(allocated_memory + reserved_memory) / 1024**2:.2f} MB"
+                f"All Memory: {(allocated_memory + reserved_memory) / 1024 ** 2:.2f} MB"
             )
 
     if args.tensorboard:
@@ -484,6 +505,21 @@ def main(local_rank):
     if local_rank == 0:
         print("Test performance..")
         print("Acc: {}, F-Score: {}".format(max(all_acc_emo), max(all_f1_emo)))
+
+        # Finalize experiment with model saver
+        if model_saver:
+            emotion_labels = ['neutral', 'surprise', 'fear', 'sadness', 'joy', 'disgust', 'anger']
+            sentiment_labels = ['negative', 'neutral', 'positive']
+            model_saver.finalize_experiment(
+                best_label_emo, best_pred_emo,
+                best_label_sen, best_pred_sen,
+                emotion_labels, sentiment_labels
+            )
+
+        # Keep original results saving for backward compatibility
+        if not os.path.exists("results"):
+            os.makedirs("results")
+
         if not os.path.exists("results/record_{}_{}_{}.pk".format(
                 today.year, today.month, today.day)):
             with open(
@@ -522,6 +558,13 @@ def main(local_rank):
                 "wb",
         ) as f:
             pk.dump(record, f)
+
+        # Save the trained model (legacy)
+        if not os.path.exists("models"):
+            os.makedirs("models")
+
+        torch.save(model.state_dict(), f"models/model_{name_}.pt")
+        print(f"Model saved to: models/model_{name_}.pt")
 
         print(
             classification_report(best_label_emo,

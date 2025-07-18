@@ -19,22 +19,22 @@ def seed_everything(seed=seed):
 
 
 def train_or_eval_model(
-    model,
-    loss_function_emo,
-    loss_function_sen,
-    loss_function_shift,
-    dataloader,
-    epoch,
-    cuda,
-    modals,
-    optimizer=None,
-    train=False,
-    dataset="IEMOCAP",
-    loss_type="",
-    lambd=[1.0, 1.0, 1.0],
-    epochs=100,
-    classify="",
-    shift_win=5,
+        model,
+        loss_function_emo,
+        loss_function_sen,
+        loss_function_shift,
+        dataloader,
+        epoch,
+        cuda,
+        modals,
+        optimizer=None,
+        train=False,
+        dataset="MELD",
+        loss_type="",
+        lambd=[1.0, 1.0, 1.0],
+        epochs=100,
+        classify="",
+        shift_win=5,
 ):
     losses, preds_emo, labels_emo = [], [], []
     preds_sft, labels_sft = [], []
@@ -54,7 +54,7 @@ def train_or_eval_model(
         if train:
             optimizer.zero_grad()
 
-        textf0, textf1, textf2, textf3, visuf, acouf, qmask, umask, label_emotion, label_sentiment = (
+        textf0, textf1, textf2, textf3, cometf0, cometf1, cometf2, cometf3, cometf4, cometf5, cometf6, cometf7, cometf8, visuf, acouf, qmask, umask, label_emotion, label_sentiment = (
             [d.cuda() for d in data[:-1]] if cuda else data[:-1])
 
         dia_lengths, label_emotions, label_sentiments = [], [], []
@@ -67,8 +67,9 @@ def train_or_eval_model(
         label_sen = torch.cat(label_sentiments)
 
         logit_emo, logit_sen, logit_sft, extracted_feature = model(
-            textf0, textf1, textf2, textf3, visuf, acouf, umask, qmask,
-            dia_lengths)
+            textf0, textf1, textf2, textf3,
+            cometf0, cometf1, cometf2, cometf3, cometf4, cometf5, cometf6, cometf7, cometf8,
+            visuf, acouf, umask, qmask, dia_lengths)
 
         prob_emo = F.log_softmax(logit_emo, -1)
         loss_emo = loss_function_emo(prob_emo, label_emo)
@@ -84,8 +85,8 @@ def train_or_eval_model(
             loss = awl(loss_emo, loss_sen, loss_sft)
         elif loss_type == "epoch":
             loss = (epoch / epochs) * (lambd[0] * loss_emo) + (
-                1 - epoch / epochs) * (lambd[1] * loss_sen +
-                                       lambd[2] * loss_sft)
+                    1 - epoch / epochs) * (lambd[1] * loss_sen +
+                                           lambd[2] * loss_sft)
         elif loss_type == "emo_sen_sft":
             loss = lambd[0] * loss_emo + lambd[1] * loss_sen + lambd[
                 2] * loss_sft

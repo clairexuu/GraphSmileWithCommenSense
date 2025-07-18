@@ -1,3 +1,6 @@
+"""
+Added COMET features on top of original GraphSmile model
+"""
 from module import HeterGConv_Edge, HeterGConvLayer, SenShift_Feat
 import torch.nn as nn
 import torch
@@ -16,11 +19,12 @@ class GraphSmile(nn.Module):
         self.shift_win = args.shift_win
 
         self.batchnorms_t = nn.ModuleList(
-            nn.BatchNorm1d(embedding_dims[0]) for _ in range(4))
+            nn.BatchNorm1d(embedding_dims[0]) for _ in range(13))
 
-        in_dims_t = (4 * embedding_dims[0] if args.textf_mode == "concat4" else
-                     (2 * embedding_dims[0]
-                      if args.textf_mode == "concat2" else embedding_dims[0]))
+        in_dims_t = (13 * embedding_dims[0] if args.textf_mode == "concat13" else
+                     (4 * embedding_dims[0] if args.textf_mode == "concat4" else
+                      (2 * embedding_dims[0]
+                       if args.textf_mode == "concat2" else embedding_dims[0])))
         self.dim_layer_t = nn.Sequential(nn.Linear(in_dims_t, args.hidden_dim),
                                          nn.LeakyReLU(), nn.Dropout(args.drop))
         self.dim_layer_v = nn.Sequential(
@@ -74,6 +78,8 @@ class GraphSmile(nn.Module):
                                       args.shift_win)
 
     def forward(self, feature_t0, feature_t1, feature_t2, feature_t3,
+                feature_c0, feature_c1, feature_c2, feature_c3, feature_c4,
+                feature_c5, feature_c6, feature_c7, feature_c8,
                 feature_v, feature_a, umask, qmask, dia_lengths):
 
         (
@@ -81,39 +87,103 @@ class GraphSmile(nn.Module):
             (seq_len_v, batch_size_v, feature_dim_v),
             (seq_len_a, batch_size_a, feature_dim_a),
         ) = [feature_t0.shape, feature_v.shape, feature_a.shape]
-        features_t = [
-            batchnorm_t(feature_t.transpose(0, 1).reshape(
-                -1, feature_dim_t)).reshape(-1, seq_len_t,
-                                            feature_dim_t).transpose(1, 0)
-            for batchnorm_t, feature_t in
-            zip(self.batchnorms_t,
-                [feature_t0, feature_t1, feature_t2, feature_t3])
-        ]
-        feature_t0, feature_t1, feature_t2, feature_t3 = features_t
+
+        # Collect all text features and find max dimensions
+        all_text_features = [feature_t0, feature_t1, feature_t2, feature_t3,
+                             feature_c0, feature_c1, feature_c2, feature_c3, feature_c4,
+                             feature_c5, feature_c6, feature_c7, feature_c8]
+
+        # Debug: Print shapes
+        # for i, feat in enumerate(all_text_features):
+        #     print(f"Feature {i} shape: {feat.shape}")
+
+        # Find max sequence length and ensure all have same batch size and feature dim
+        max_seq_len = max([feat.shape[0] for feat in all_text_features])
+        target_batch_size = batch_size_t
+        target_feature_dim = feature_dim_t
+
+        # Align all features to same dimensions
+        aligned_features = []
+        for i, feature_t in enumerate(all_text_features):
+            seq_len_curr, batch_size_curr, feature_dim_curr = feature_t.shape
+
+            # Handle batch size mismatch
+            if batch_size_curr != target_batch_size:
+                if batch_size_curr < target_batch_size:
+                    # Pad batch dimension
+                    padding = torch.zeros(seq_len_curr, target_batch_size - batch_size_curr, feature_dim_curr,
+                                          device=feature_t.device, dtype=feature_t.dtype)
+                    feature_t = torch.cat([feature_t, padding], dim=1)
+                else:
+                    # Truncate batch dimension
+                    feature_t = feature_t[:, :target_batch_size, :]
+
+            # Handle feature dimension mismatch
+            if feature_dim_curr != target_feature_dim:
+                if feature_dim_curr < target_feature_dim:
+                    # Pad feature dimension
+                    padding = torch.zeros(seq_len_curr, target_batch_size, target_feature_dim - feature_dim_curr,
+                                          device=feature_t.device, dtype=feature_t.dtype)
+                    feature_t = torch.cat([feature_t, padding], dim=2)
+                else:
+                    # Truncate feature dimension
+                    feature_t = feature_t[:, :, :target_feature_dim]
+
+            # Handle sequence length mismatch
+            if seq_len_curr < max_seq_len:
+                # Pad sequence dimension
+                padding = torch.zeros(max_seq_len - seq_len_curr, target_batch_size, target_feature_dim,
+                                      device=feature_t.device, dtype=feature_t.dtype)
+                feature_t = torch.cat([feature_t, padding], dim=0)
+            elif seq_len_curr > max_seq_len:
+                # Truncate sequence dimension
+                feature_t = feature_t[:max_seq_len, :, :]
+
+            aligned_features.append(feature_t)
+
+        # Apply batch normalization to aligned features
+        features_t = []
+        for i, (batchnorm_t, feature_t) in enumerate(zip(self.batchnorms_t, aligned_features)):
+            feature_t_norm = batchnorm_t(feature_t.transpose(0, 1).reshape(
+                -1, target_feature_dim)).reshape(-1, max_seq_len,
+                                                 target_feature_dim).transpose(1, 0)
+            features_t.append(feature_t_norm)
+
+        feature_t0, feature_t1, feature_t2, feature_t3, feature_c0, feature_c1, feature_c2, feature_c3, feature_c4, feature_c5, feature_c6, feature_c7, feature_c8 = features_t
+
+        # Update dimensions to aligned values
+        seq_len_t = max_seq_len
+        batch_size_t = target_batch_size
+        feature_dim_t = target_feature_dim
 
         dim_layer_dict_t = {
+            "concat13":
+                lambda: self.dim_layer_t(
+                    torch.cat([feature_t0, feature_t1, feature_t2, feature_t3,
+                               feature_c0, feature_c1, feature_c2, feature_c3, feature_c4,
+                               feature_c5, feature_c6, feature_c7, feature_c8], dim=-1)),
             "concat4":
-            lambda: self.dim_layer_t(
-                torch.cat([feature_t0, feature_t1, feature_t2, feature_t3],
-                          dim=-1)),
+                lambda: self.dim_layer_t(
+                    torch.cat([feature_t0, feature_t1, feature_t2, feature_t3],
+                              dim=-1)),
             "sum4":
-            lambda:
-            (self.dim_layer_t(feature_t0) + self.dim_layer_t(feature_t1) + self
-             .dim_layer_t(feature_t2) + self.dim_layer_t(feature_t3)) / 4,
+                lambda:
+                (self.dim_layer_t(feature_t0) + self.dim_layer_t(feature_t1) + self
+                 .dim_layer_t(feature_t2) + self.dim_layer_t(feature_t3)) / 4,
             "concat2":
-            lambda: self.dim_layer_t(
-                torch.cat([feature_t0, feature_t1], dim=-1)),
+                lambda: self.dim_layer_t(
+                    torch.cat([feature_t0, feature_t1], dim=-1)),
             "sum2":
-            lambda:
-            (self.dim_layer_t(feature_t0) + self.dim_layer_t(feature_t1)) / 2,
+                lambda:
+                (self.dim_layer_t(feature_t0) + self.dim_layer_t(feature_t1)) / 2,
             "textf0":
-            lambda: self.dim_layer_t(feature_t0),
+                lambda: self.dim_layer_t(feature_t0),
             "textf1":
-            lambda: self.dim_layer_t(feature_t1),
+                lambda: self.dim_layer_t(feature_t1),
             "textf2":
-            lambda: self.dim_layer_t(feature_t2),
+                lambda: self.dim_layer_t(feature_t2),
             "textf3":
-            lambda: self.dim_layer_t(feature_t3),
+                lambda: self.dim_layer_t(feature_t3),
         }
         featdim_t = dim_layer_dict_t[self.textf_mode]()
         featdim_v, featdim_a = self.dim_layer_v(feature_v), self.dim_layer_a(

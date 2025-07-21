@@ -1,8 +1,9 @@
 """
 python -u run.py --gpu 0 --port 1532 --classify emotion \
---dataset MELD --epochs 50 --textf_mode concat13 \
+--dataset MELD --epochs 50 --textf_mode graphsmile_cosmic \
 --loss_type emo_sen_sft --lr 7e-05 --batch_size 16 --hidden_dim 384 \
---win 3 3 --heter_n_layers 5 5 5 --drop 0.2 --shift_win 3 --lambd 1.0 0.5 0.2
+--win 3 3 --heter_n_layers 5 5 5 --drop 0.2 --shift_win 3 --lambd 1.0 0.5 0.2 \
+--balance_strategy subsample
 
 Path to feature pickle files might need to be modified.
 """
@@ -20,8 +21,11 @@ import torch.multiprocessing as mp
 from torch.utils.data.distributed import DistributedSampler
 import time
 from utils import AutomaticWeightedLoss
-from hybrid_model import ModifiedGraphSmile
-# from model import GraphSmile # Change to this to only GraphSmile architecture just with all feature concatenated
+
+# from hybrid_model import ModifiedGraphSmile
+from GraphSmile_COSMIC_model import GraphSmile_COSMIC
+# from model import GraphSmile 
+
 from sklearn.metrics import confusion_matrix, classification_report
 from trainer import train_or_eval_model, seed_everything
 from dataloader import MELDDataset_BERT
@@ -72,7 +76,7 @@ parser.add_argument(
 parser.add_argument(
     "--textf_mode",
     default="concat13",
-    help="text feature mode: textf0/textf1/textf2/textf3/concat2/concat4/concat13/sum2/sum4",
+    help="text feature mode: textf0/textf1/textf2/textf3/concat2/concat4/concat13/sum2/sum4/gated_fusion/graphsimile_cosmic/dual_encoder",
 )
 
 parser.add_argument(
@@ -121,8 +125,10 @@ parser.add_argument(
     help="[loss_emotion, loss_sentiment, loss_shift]",
 )
 
-parser.add_argument('--balance_strategy', default='oversample', help='oversample / subsample / None')
+parser.add_argument('--balance_strategy', default='None', help='oversample / subsample / None')
 parser.add_argument('--balance_target', default='emotion', help='Target for class balancing')
+parser.add_argument('--weight', default='false', help='apply COSMIC weight or not')
+parser.add_argument('--role_dim', type=int, default=150, help='dimension of speaker / listener')
 
 args = parser.parse_args()
 
@@ -133,7 +139,7 @@ world_size = torch.cuda.device_count()
 os.environ["WORLD_SIZE"] = str(world_size)
 
 MELD_path = "features/meld_multi_features.pkl"
-COMET_path = "features/meld_multi_features.pkl"
+COMET_path = "features/meld_features_comet.pkl"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -228,7 +234,8 @@ def main(local_rank):
 
     # Create model saver for this experiment
     balance_suffix = f"_{args.balance_strategy}_{args.balance_target}" if args.balance_strategy else ""
-    experiment_name = f"{name_}_{args.textf_mode}_{args.classify}{balance_suffix}"
+    weight_suffix = f"_weighted" if args.weight == "true" else ""
+    experiment_name = f"{name_}_{args.textf_mode}_{args.classify}{balance_suffix}{weight_suffix}"
     model_saver = create_model_saver(experiment_name) if local_rank == 0 else None
 
     if local_rank == 0:
@@ -248,7 +255,7 @@ def main(local_rank):
     n_classes_emo = 7
 
     seed_everything()
-    model = ModifiedGraphSmile(args, embedding_dims, n_classes_emo)
+    model = GraphSmile_COSMIC(args, embedding_dims, n_classes_emo)
 
     model = model.to(local_rank)
     model = DDP(
@@ -258,17 +265,16 @@ def main(local_rank):
         find_unused_parameters=True,
     )
 
-    # device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() and not args.no_cuda else "cpu")
-
-    # COSMIC_weights = torch.tensor(
-    #     [0.30427062, 1.19699616, 5.47007183, 1.95437696, 0.84847735, 5.42461417, 1.21859721],
-    #     dtype=torch.float32,
-    #     device=device
-    # )
-
-    # loss_function_emo = nn.NLLLoss(weight=COSMIC_weights)
-
-    loss_function_emo = nn.NLLLoss()
+    if args.weight == "true": 
+        device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() and not args.no_cuda else "cpu")
+        COSMIC_weights = torch.tensor(
+            [0.30427062, 1.19699616, 5.47007183, 1.95437696, 0.84847735, 5.42461417, 1.21859721],
+            dtype=torch.float32,
+            device=device
+        )
+        loss_function_emo = nn.NLLLoss(weight=COSMIC_weights)
+    else: 
+        loss_function_emo = nn.NLLLoss()
 
     loss_function_sen = nn.NLLLoss()
     loss_function_shift = nn.NLLLoss()
@@ -316,7 +322,7 @@ def main(local_rank):
     all_f1_sft, all_acc_sft = [], []
 
     for epoch in range(n_epochs):
-        trainset = MELDDataset_BERT(MELD_path, train=True)
+        trainset = MELDDataset_BERT(COMET_path, MELD_path, train=True)
 
         setup_samplers(trainset, valid_ratio=0.1, epoch=epoch)
 

@@ -66,43 +66,37 @@ class MELDDataset_BERT(Dataset):
         self.labels_emotion = self.videoLabels
         self.labels_sentiment = self.videoSentiments
 
-        if self.train and balance_strategy == 'oversample' and balance_target == 'emotion':
-            all_keys = []
-            label_counts = {i: [] for i in range(7)}  # emotion classes
+        # Count dominant label per dialogue
+        label_to_vids = {i: [] for i in range(7)}  # 7 emotion classes
 
-            for vid in self.keys:
-                labels = self.videoLabels[vid]
-                unique_emotions = set(labels)
-                for emo in unique_emotions:
-                    label_counts[emo].append(vid)
+        for vid in self.keys:
+            emo_labels = self.videoLabels[vid]
+            dominant_label = Counter(emo_labels).most_common(1)[0][0]
+            label_to_vids[dominant_label].append(vid)
 
-            # light oversampling targets (at most 2x minority class)
-            min_target = min(len(v) for v in label_counts.values())
-            max_target = min(2 * min_target, int(0.3 * len(self.keys)))  # 30% cap
+        if self.train and self.balance_strategy == 'oversample' and self.balance_target == 'emotion':
+            # Choose target size: 2x minimum class size, or 30% of full size (cap)
+            min_class_size = min(len(v) for v in label_to_vids.values())
+            max_target = min(2 * min_class_size, int(0.3 * len(self.keys)))
 
-            all_keys = []
-            for emo, vids in label_counts.items():
-                multiplier = max_target // len(vids)
-                remainder = max_target % len(vids)
-                sampled = vids * multiplier + random.sample(vids, min(remainder, len(vids)))
-                all_keys.extend(sampled)
+            oversampled_keys = []
+            for emo, vids in label_to_vids.items():
+                if len(vids) < max_target:
+                    multiplier = max_target // len(vids)
+                    remainder = max_target % len(vids)
+                    sampled = vids * multiplier + random.sample(vids, min(remainder, len(vids)))
+                else:
+                    sampled = vids
+                oversampled_keys.extend(sampled)
 
-            self.keys = list(set(self.keys + all_keys))  # add oversampled examples
-            print(f"[Data Balance] Oversampled minority emotion classes to {len(self.keys)} samples total.")
+            self.keys = list(set(self.keys + oversampled_keys))
+            print(f"[Data Balance] Oversampled minority dominant emotion classes to {len(self.keys)} dialogues total.")
 
-        elif self.train and balance_strategy == 'subsample' and balance_target == 'emotion':
-            # Group video IDs by their dominant emotion label
-            label_to_vids = {i: [] for i in range(7)}
-            for vid in self.keys:
-                emo_labels = self.videoLabels[vid]
-                most_common_label = Counter(emo_labels).most_common(1)[0][0]
-                label_to_vids[most_common_label].append(vid)
-
-            # Determine smallest class size
+        elif self.train and self.balance_strategy == 'subsample' and self.balance_target == 'emotion':
+            # Subsample each dominant class to the minimum available size
             min_class_size = min(len(v) for v in label_to_vids.values())
             target_size = int(min_class_size * 1.5)
 
-            # Subsample each class to target size
             balanced_keys = []
             for emo, vids in label_to_vids.items():
                 if len(vids) > target_size:
@@ -111,10 +105,10 @@ class MELDDataset_BERT(Dataset):
                     subsampled = vids
                 balanced_keys.extend(subsampled)
 
-                self.keys = balanced_keys
-                self.len = len(self.keys)
-                print(
-                    f"[Data Balance] Subsampled all emotion classes to {target_size} videos per class, {len(self.keys)} samples total.")
+            self.keys = balanced_keys
+            print(f"[Data Balance] Subsampled dominant emotion classes to {len(self.keys)} dialogues total.")
+
+        self.len = len(self.keys)
 
     def __getitem__(self, index):
         vid = self.keys[index]
@@ -136,7 +130,9 @@ class MELDDataset_BERT(Dataset):
             # Video features
             torch.FloatTensor(np.array(self.videoVisual[vid])),
             torch.FloatTensor(np.array(self.videoAudio[vid])),
-            torch.FloatTensor(np.array(self.videoSpeakers[vid])),
+            torch.FloatTensor(
+                [[1, 0] if spk == "M" else [0, 1] for spk in self.videoSpeakers[vid]]
+            ),
             torch.FloatTensor([1] * len(np.array(self.labels_emotion[vid]))),
             torch.LongTensor(np.array(self.labels_emotion[vid])),
             torch.LongTensor(np.array(self.labels_sentiment[vid])),
@@ -157,8 +153,7 @@ class MELDDataset_BERT(Dataset):
 
         return [
             (
-                pad_sequence(dat[i])
-                if i < 16
+                pad_sequence(dat[i]) if i < 16
                 else pad_sequence(dat[i]) if i < 19 else dat[i].tolist()
             )
             for i in dat

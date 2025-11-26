@@ -86,14 +86,6 @@ GraphSmileWithCommonSense/
 └── features/                         # Pre-extracted features (if available)
 ```
 
-### Key Files Explained
-
-- **[dataloader.py](src/dataloader.py)**: Loads and preprocesses multimodal features (text, audio, vision) and integrates commonsense inference vectors
-- **[commonsense_model.py](src/commonsense_model.py)**: Implements GRU-based encoding of COMET/COSMIC commonsense outputs into structured representations
-- **[GraphSmile_COSMIC_model.py](src/GraphSmile_COSMIC_model.py)**: Defines the core heterogeneous graph architecture that extends GraphSmile with commonsense reasoning nodes
-- **[hybrid_model.py](src/hybrid_model.py)**: Implements the fusion mechanism that combines modal embeddings, commonsense embeddings, and graph-based representations
-- **[trainer.py](src/trainer.py)** & **[scripts/run.py](scripts/run.py)**: Training and evaluation pipeline with hyperparameter configurations and logging
-
 ---
 
 ## Benchmark & Evaluation
@@ -131,7 +123,7 @@ The results demonstrate that our hybrid architecture successfully combines the s
 
 ## How to Use
 
-### Prerequisites
+### 1. Prerequisites
 
 - Python 3.7+
 - PyTorch 2.0+
@@ -140,7 +132,7 @@ The results demonstrate that our hybrid architecture successfully combines the s
 pip install -r requirements.txt
 ```
 
-### Prepare the MELD Dataset
+### 2. Prepare the MELD Dataset
 
 1. **Download MELD dataset**: Visit [MELD Dataset](https://affective-meld.github.io/) and download the data
 2. **Download pre-extracted features**:

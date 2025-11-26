@@ -3,7 +3,7 @@
 
 ---
 
-## 🚀 Project Motivation
+## Project Motivation
 
 Understanding human emotion in conversations is a core challenge in multimodal AI: text, audio, and visual cues interweave with implicit commonsense knowledge and speaker-role dynamics. In this project, we explore how to fuse **commonsense inferences** (via the COSMIC model) with a **heterogeneous graph structure** (inspired by GraphSmile) to improve emotion recognition in dialogues.
 
@@ -11,7 +11,7 @@ This aligns with my interest in bridging representation learning, human-centric 
 
 ---
 
-## 🧠 Technical Highlights
+## Technical Highlights
 
 - **Integration of COMET-/COSMIC-generated commonsense triples** into a multimodal pipeline (text + audio + vision)
 - Construction of a **heterogeneous conversation graph**: nodes represent modalities, speaker roles and contextual commonsense; edges model inter- and intra-speaker dynamics
@@ -22,7 +22,7 @@ This aligns with my interest in bridging representation learning, human-centric 
 
 ---
 
-## 🏗 Architecture Overview
+## Architecture Overview
 
 This project combines two foundational models:
 
@@ -63,7 +63,7 @@ This architecture addresses key challenges:
 
 ---
 
-## 📁 Project Structure
+## Project Structure
 
 ```text
 GraphSmileWithCommonSense/
@@ -96,7 +96,7 @@ GraphSmileWithCommonSense/
 
 ---
 
-## 📊 Benchmark & Evaluation
+## Benchmark & Evaluation
 
 ### Performance on MELD Dataset
 
